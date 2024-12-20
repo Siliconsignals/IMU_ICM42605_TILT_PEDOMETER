@@ -1,0 +1,347 @@
+From dbb83496680fae371701c10659fd47bd45c8a71f Mon Sep 17 00:00:00 2001
+From: Tarang Raval <tarang.raval@siliconsignal.io> 
+Date: Tue, 15 Oct 2024 14:41:10 +0530
+Subject: [PATCH] iio: imu: inv_icm42600: Enable Pedometer Functionality
+
+Enables pedometer functionality in the ICM42605 IMU sensor.
+
+The pedometer feature allows for step counting, which is accessible through
+a new sysfs entry. Interrupts are triggered when a step event occurs, enabling
+step event detection.
+
+Signed-off-by: Tarang Raval <tarang.raval@siliconsignal.io>
+---
+ drivers/iio/imu/inv_icm42600/inv_icm42600.h   |  16 ++
+ .../iio/imu/inv_icm42600/inv_icm42600_accel.c | 165 ++++++++++++++++++
+ .../iio/imu/inv_icm42600/inv_icm42600_core.c  |  36 +++-
+ 3 files changed, 211 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/iio/imu/inv_icm42600/inv_icm42600.h b/drivers/iio/imu/inv_icm42600/inv_icm42600.h
+index 3a07e43e4cf1..c3471b73152e 100644
+--- a/drivers/iio/imu/inv_icm42600/inv_icm42600.h
++++ b/drivers/iio/imu/inv_icm42600/inv_icm42600.h
+@@ -122,6 +122,7 @@ struct inv_icm42600_sensor_conf {
+ 	int filter;
+ };
+ #define INV_ICM42600_SENSOR_CONF_INIT		{-1, -1, -1, -1}
++#define INV_ICM42600_SENSOR_CONF_APEX		{ 2, 0, 9, 6}
+ 
+ struct inv_icm42600_conf {
+ 	struct inv_icm42600_sensor_conf gyro;
+@@ -141,6 +142,8 @@ struct inv_icm42600_suspended {
+  *  @chip:		chip identifier.
+  *  @name:		chip name.
+  *  @map:		regmap pointer.
++ *  @pedometer_enable	status of pedometer function
++ *  @pedometer_value	status of steps event occurnce
+  *  @vdd_supply:	VDD voltage regulator for the chip.
+  *  @vddio_supply:	I/O voltage regulator for the chip.
+  *  @orientation:	sensor chip orientation relative to main hardware.
+@@ -157,6 +160,8 @@ struct inv_icm42600_state {
+ 	enum inv_icm42600_chip chip;
+ 	const char *name;
+ 	struct regmap *map;
++	bool pedometer_enable;
++	bool pedometer_value;
+ 	struct regulator *vdd_supply;
+ 	struct regulator *vddio_supply;
+ 	struct iio_mount_matrix orientation;
+@@ -301,6 +306,15 @@ struct inv_icm42600_sensor_state {
+ #define INV_ICM42600_GYRO_ACCEL_CONFIG0_GYRO_FILT(_f)	\
+ 		FIELD_PREP(GENMASK(3, 0), (_f))
+ 
++/* Pedometer functionality */
++#define INV_ICM42600_REG_APEX_CONFIG0                  0x0056
++#define INV_ICM42600_DMP_ODR_50Hz                      BIT(1)
++#define INV_ICM42600_PED_ENABLE                        BIT(5)
++#define INV_ICM42600_REG_INT_STATUS3                   0x0038
++#define INV_ICM42600_STEP_DET_INT                      BIT(5)
++#define INV_ICM42600_REG_APEX_DATA                     0x0031 // 2 Byte little-endian
++
++
+ #define INV_ICM42600_REG_TMST_CONFIG			0x0054
+ #define INV_ICM42600_TMST_CONFIG_MASK			GENMASK(4, 0)
+ #define INV_ICM42600_TMST_CONFIG_TMST_TO_REGS_EN	BIT(4)
+@@ -373,6 +387,8 @@ struct inv_icm42600_sensor_state {
+ #define INV_ICM42600_INTF_CONFIG6_I3C_SDR_EN		BIT(0)
+ 
+ /* User bank 4 (MSB 0x40) */
++#define INV_ICM42600_REG_INT_SOURCE6                    0x404D
++#define INV_ICM42600_STEP_DET_INT1_EN              	BIT(5)
+ #define INV_ICM42600_REG_INT_SOURCE8			0x404F
+ #define INV_ICM42600_INT_SOURCE8_FSYNC_IBI_EN		BIT(5)
+ #define INV_ICM42600_INT_SOURCE8_PLL_RDY_IBI_EN		BIT(4)
+diff --git a/drivers/iio/imu/inv_icm42600/inv_icm42600_accel.c b/drivers/iio/imu/inv_icm42600/inv_icm42600_accel.c
+index 56ac19814250..90fe4c9e15ab 100644
+--- a/drivers/iio/imu/inv_icm42600/inv_icm42600_accel.c
++++ b/drivers/iio/imu/inv_icm42600/inv_icm42600_accel.c
+@@ -160,6 +160,13 @@ static const struct iio_chan_spec_ext_info inv_icm42600_accel_ext_infos[] = {
+ 	{},
+ };
+ 
++static const struct iio_event_spec icm42600_step_event = {
++	.type = IIO_EV_TYPE_CHANGE,
++	.dir = IIO_EV_DIR_NONE,
++	.mask_shared_by_type = BIT(IIO_EV_INFO_ENABLE) |
++	                       BIT(IIO_EV_INFO_VALUE),
++};
++
+ static const struct iio_chan_spec inv_icm42600_accel_channels[] = {
+ 	INV_ICM42600_ACCEL_CHAN(IIO_MOD_X, INV_ICM42600_ACCEL_SCAN_X,
+ 				inv_icm42600_accel_ext_infos),
+@@ -169,6 +176,14 @@ static const struct iio_chan_spec inv_icm42600_accel_channels[] = {
+ 				inv_icm42600_accel_ext_infos),
+ 	INV_ICM42600_TEMP_CHAN(INV_ICM42600_ACCEL_SCAN_TEMP),
+ 	IIO_CHAN_SOFT_TIMESTAMP(INV_ICM42600_ACCEL_SCAN_TIMESTAMP),
++	{
++	        .type = IIO_STEPS,
++	        .info_mask_separate = BIT(IIO_CHAN_INFO_PROCESSED),
++	        .scan_index = -1,
++	        .event_spec = &icm42600_step_event,
++	        .num_event_specs = 1,
++	},
++
+ };
+ 
+ /*
+@@ -668,6 +683,31 @@ static int inv_icm42600_accel_write_offset(struct inv_icm42600_state *st,
+ 	return ret;
+ }
+ 
++static int inv_icm42600_steps_read_raw(struct iio_dev *indio_dev,
++                               struct iio_chan_spec const *chan,
++                               int *val, int *val2, long mask)
++{
++       struct inv_icm42600_state *st = iio_device_get_drvdata(indio_dev);
++       __le16 steps;
++       int ret;
++
++       if (mask == IIO_CHAN_INFO_PROCESSED) {
++               ret = iio_device_claim_direct_mode(indio_dev);
++               if (ret)
++                       return ret;
++               ret = regmap_bulk_read(st->map, INV_ICM42600_REG_APEX_DATA, &steps, sizeof(steps));
++               if (ret)
++                       return ret;
++               iio_device_release_direct_mode(indio_dev);
++               if (ret)
++                       return ret;
++               *val = steps;
++               return IIO_VAL_INT;
++       }
++
++       return -EINVAL;
++}
++
+ static int inv_icm42600_accel_read_raw(struct iio_dev *indio_dev,
+ 				       struct iio_chan_spec const *chan,
+ 				       int *val, int *val2, long mask)
+@@ -681,6 +721,8 @@ static int inv_icm42600_accel_read_raw(struct iio_dev *indio_dev,
+ 		break;
+ 	case IIO_TEMP:
+ 		return inv_icm42600_temp_read_raw(indio_dev, chan, val, val2, mask);
++	case IIO_STEPS:
++		return inv_icm42600_steps_read_raw(indio_dev, chan, val, val2, mask);
+ 	default:
+ 		return -EINVAL;
+ 	}
+@@ -824,6 +866,126 @@ static int inv_icm42600_accel_hwfifo_flush(struct iio_dev *indio_dev,
+ 	return ret;
+ }
+ 
++/*****************Pedometer Functionality**************/
++static int inv_icm42600_step_en(struct inv_icm42600_state *st, int state)
++{
++	struct inv_icm42600_sensor_conf conf = INV_ICM42600_SENSOR_CONF_APEX;
++	int ret, value;
++
++	if (state) {
++
++		ret = inv_icm42600_set_accel_conf(st, &conf, NULL);
++		if (ret)
++			return ret;
++
++		ret = regmap_write(st->map, INV_ICM42600_REG_APEX_CONFIG0,
++		                        INV_ICM42600_DMP_ODR_50Hz);
++		if (ret)
++			return ret;
++
++		ret = regmap_write(st->map, INV_ICM42600_REG_SIGNAL_PATH_RESET,
++		                        INV_ICM42600_SIGNAL_PATH_RESET_DMP_MEM_RESET);
++		if (ret)
++			return ret;
++		msleep(1);
++
++		ret = regmap_write(st->map, INV_ICM42600_REG_SIGNAL_PATH_RESET,
++		                        INV_ICM42600_SIGNAL_PATH_RESET_DMP_INIT_EN);
++		if (ret)
++			return ret;
++
++		ret = regmap_write(st->map, INV_ICM42600_REG_INT_SOURCE6,
++		                        INV_ICM42600_STEP_DET_INT1_EN);
++		if (ret)
++			return ret;
++
++		value = INV_ICM42600_DMP_ODR_50Hz | INV_ICM42600_PED_ENABLE;
++		ret = regmap_write(st->map, INV_ICM42600_REG_APEX_CONFIG0, value);
++		if (ret)
++			return ret;
++
++		st->pedometer_enable = true;
++
++	} else {
++
++		ret = regmap_write(st->map, INV_ICM42600_REG_APEX_CONFIG0, 0);
++		if (ret)
++			return ret;
++
++		ret = regmap_write(st->map, INV_ICM42600_REG_INT_SOURCE6, 0);
++		if (ret)
++			return ret;
++
++		st->pedometer_enable = false;
++	 }
++
++	return 0;
++}
++
++static int inv_icm42600_write_event_config(struct iio_dev *indio_dev,
++                                     const struct iio_chan_spec *chan,
++                                     enum iio_event_type type,
++                                     enum iio_event_direction dir, int state)
++{
++	struct inv_icm42600_state *st = iio_device_get_drvdata(indio_dev);
++	int ret;
++
++	if(chan->type != IIO_STEPS)
++	        return -EINVAL;
++
++	mutex_lock(&st->lock);
++
++	ret = inv_icm42600_step_en(st, state);
++
++	mutex_unlock(&st->lock);
++	return ret;
++}
++
++static int inv_icm42600_read_event_config(struct iio_dev *indio_dev,
++                                    const struct iio_chan_spec *chan,
++                                    enum iio_event_type type,
++                                    enum iio_event_direction dir)
++{
++	struct inv_icm42600_state *st = iio_device_get_drvdata(indio_dev);
++	int value;
++
++	if (chan->type != IIO_STEPS)
++	        return -EINVAL;
++
++	regmap_read(st->map, INV_ICM42600_REG_APEX_CONFIG0, &value);
++
++	if (value & INV_ICM42600_PED_ENABLE)
++	        return 1;
++	else
++	        return 0;
++}
++
++static int inv_icm42600_read_event_value(struct iio_dev *indio_dev,
++                                   const struct iio_chan_spec *chan,
++                                   enum iio_event_type type,
++                                   enum iio_event_direction dir,
++                                   enum iio_event_info info,
++                                   int *val, int *val2)
++{
++	struct inv_icm42600_state *st = iio_device_get_drvdata(indio_dev);
++
++	mutex_lock(&st->lock);
++
++	if (type == IIO_EV_TYPE_CHANGE) {
++		if (st->pedometer_value == true) {
++			*val = 1;
++		        st->pedometer_value = false;
++		} else {
++		        *val = 0;
++		}
++		mutex_unlock(&st->lock);
++		return IIO_VAL_INT;
++	}
++
++	mutex_unlock(&st->lock);
++	return -EINVAL;
++}
++
+ static const struct iio_info inv_icm42600_accel_info = {
+ 	.read_raw = inv_icm42600_accel_read_raw,
+ 	.read_avail = inv_icm42600_accel_read_avail,
+@@ -833,6 +995,9 @@ static const struct iio_info inv_icm42600_accel_info = {
+ 	.update_scan_mode = inv_icm42600_accel_update_scan_mode,
+ 	.hwfifo_set_watermark = inv_icm42600_accel_hwfifo_set_watermark,
+ 	.hwfifo_flush_to_buffer = inv_icm42600_accel_hwfifo_flush,
++	.write_event_config = inv_icm42600_write_event_config,
++	.read_event_config  = inv_icm42600_read_event_config,
++	.read_event_value   = inv_icm42600_read_event_value,
+ };
+ 
+ struct iio_dev *inv_icm42600_accel_init(struct inv_icm42600_state *st)
+diff --git a/drivers/iio/imu/inv_icm42600/inv_icm42600_core.c b/drivers/iio/imu/inv_icm42600/inv_icm42600_core.c
+index c3924cc6190e..4d78cb5ca396 100644
+--- a/drivers/iio/imu/inv_icm42600/inv_icm42600_core.c
++++ b/drivers/iio/imu/inv_icm42600/inv_icm42600_core.c
+@@ -15,7 +15,8 @@
+ #include <linux/pm_runtime.h>
+ #include <linux/property.h>
+ #include <linux/regmap.h>
+-
++#include <linux/iio/events.h>
++#include <linux/of_irq.h>
+ #include <linux/iio/iio.h>
+ 
+ #include "inv_icm42600.h"
+@@ -533,6 +534,19 @@ static irqreturn_t inv_icm42600_irq_handler(int irq, void *_data)
+ 
+ 	mutex_lock(&st->lock);
+ 
++	ret = regmap_read(st->map, INV_ICM42600_REG_INT_STATUS3, &status);
++	if (ret)
++	        goto out_unlock;
++
++	if (status & INV_ICM42600_STEP_DET_INT) {
++	        iio_push_event(st->indio_accel, IIO_MOD_EVENT_CODE(IIO_STEPS, 0,
++	                                                     IIO_NO_MOD,
++	                                                     IIO_EV_TYPE_CHANGE,
++	                                                     IIO_EV_DIR_NONE),
++	                                                        st->timestamp.accel);
++	        st->pedometer_value = true;
++	}
++
+ 	ret = regmap_read(st->map, INV_ICM42600_REG_INT_STATUS, &status);
+ 	if (ret)
+ 		goto out_unlock;
+@@ -860,12 +876,20 @@ static int inv_icm42600_runtime_suspend(struct device *dev)
+ 	mutex_lock(&st->lock);
+ 
+ 	/* disable all sensors */
+-	ret = inv_icm42600_set_pwr_mgmt0(st, INV_ICM42600_SENSOR_MODE_OFF,
+-					 INV_ICM42600_SENSOR_MODE_OFF, false,
+-					 NULL);
+-	if (ret)
+-		goto error_unlock;
++	if (st->pedometer_enable) {
++		ret = inv_icm42600_set_pwr_mgmt0(st, INV_ICM42600_SENSOR_MODE_OFF,
++						 INV_ICM42600_SENSOR_MODE_LOW_POWER,
++						false, NULL);
++		if (ret)
++			goto error_unlock;
++	} else {
+ 
++		ret = inv_icm42600_set_pwr_mgmt0(st, INV_ICM42600_SENSOR_MODE_OFF,
++						 INV_ICM42600_SENSOR_MODE_OFF,
++						 false, NULL);
++		if (ret)
++			goto error_unlock;
++	}
+ 	regulator_disable(st->vddio_supply);
+ 
+ error_unlock:
+-- 
+2.43.0
+
